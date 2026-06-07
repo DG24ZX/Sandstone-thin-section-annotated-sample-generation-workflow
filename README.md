@@ -1,105 +1,167 @@
-# Sandstone Thin-Section Annotated Sample Generation
+# Sandstone Thin-Section Generation Workflow
 
-This repository contains the thin-section image generation code used for the manuscript:
+This repository provides a simplified demonstration of the synthetic sandstone thin-section generation workflow used in the manuscript:
 
 **Automated generation method of labeled sandstone thin-section images for intelligent identification**
 
-## Main workflow
-
-1. Read a digital-core label slice from a raw file.
-2. Segment mineral regions into independent particle instances using watershed segmentation.
-3. Select matched real or pre-generated particle textures from a mineral particle library.
-4. Reconstruct one cross-polarized light (XPL) image and one plane-polarized light (PPL) image using structure-constrained texture mapping.
-5. Simulate pore appearance, feldspar dissolution, and clay-mineral cementation rims.
-6. Save the reconstructed XPL image, PPL image, and single-channel semantic label mask as a dataset sample for semantic segmentation.
+The notebook is intended to illustrate the main methodological steps of the proposed workflow. It does not represent the complete experimental dataset, full digital-core data, or complete mineral particle library used in the study.
 
 ## Repository structure
 
 ```text
-sandstone_thinsection_generation/
-├── configs/
-│   └── example_config.yaml
-├── scripts/
-│   ├── generate_from_raw.py
-│   └── convert_mask_colors.py
-├── src/
-│   └── thinsection_generator/
-│       ├── enhancement.py
-│       ├── io.py
-│       ├── mask_conversion.py
-│       ├── pipeline.py
-│       ├── reconstruction.py
-│       ├── segmentation.py
-│       └── texture.py
-├── requirements.txt
-└── README.md
+sandstone-thin-section-generation/
+├── example/
+│   ├── 3D_rock_data/
+│   └── v2_keli_data/
+├── generated_dataset/
+│   ├── labels/
+│   ├── ppl/
+│   └── xpl/
+├── thin-section_generation_workflow_sample.ipynb
+└── tools.py
 ```
 
-## Input data requirements
+## Description of files and folders
 
-### Digital-core raw file
+### `tools.py`
 
-The digital-core label raw file is expected to contain integer labels, for example:
+This file contains the core functions used in the thin-section generation workflow, including:
 
-- `0`: pore/background
-- `1`: quartz
-- `2`: feldspar
-- `3`: lithic fragments
+* reading digital-core slices;
+* watershed-based particle instance segmentation;
+* generation and smoothing of particle masks;
+* particle texture matching and mapping;
+* reconstruction of one plane-polarized light image and one cross-polarized light image;
+* simulation-based enhancement of pore features, feldspar dissolution, and clay-mineral cementation rims;
+* saving XPL, PPL, and label masks for semantic segmentation.
 
-### Particle library
+### `thin-section_generation_workflow_sample.ipynb`
 
-Each mineral particle library should contain paired XPL and PPL particle images with the same filenames. The default folder names are:
+This notebook demonstrates the complete workflow step by step. The main steps are:
+
+1. Read digital-core slices.
+2. Build dissolution and cementation masks.
+3. Segment mineral regions into independent particle instances.
+4. Reconstruct one cross-polarized light image and one plane-polarized light image using particle texture mapping.
+5. Apply simulation-based enhancement.
+6. Save XPL, PPL, and single-channel label masks for semantic segmentation.
+
+### `example/`
+
+This folder contains example input data used to demonstrate the workflow.
 
 ```text
-quartzData/
-├── cross_1/     # one-angle XPL particle images
-└── single/      # PPL particle images
+example/
+├── 3D_rock_data/
+└── v2_keli_data/
 ```
 
-The code can also automatically detect the following aliases:
+* `3D_rock_data/` contains example digital-core data used for generating structural label slices.
+* `v2_keli_data/` contains example mineral particle texture libraries used for texture mapping.
 
-- XPL folder: `xpl`, `cross`, or `cross_1`
-- PPL folder: `ppl` or `single`
+The particle library should follow the structure below:
 
-The same structure should be used for quartz, feldspar, and lithic particle libraries.
-
-## Installation
-
-```bash
-pip install -r requirements.txt
+```text
+v2_keli_data/
+├── quartzData/
+│   ├── cross_1/
+│   └── single/
+├── feldsparData/
+│   ├── cross_1/
+│   └── single/
+└── rockchipsData/
+    ├── cross_1/
+    └── single/
 ```
 
-## Usage
+where:
 
-Edit `configs/example_config.yaml` to match your local paths, then run:
+* `cross_1/` contains cross-polarized light particle textures;
+* `single/` contains plane-polarized light particle textures.
 
-```bash
-python scripts/generate_from_raw.py --config configs/example_config.yaml
-```
+For each mineral particle, the corresponding XPL and PPL images should have the same file name.
 
-The generated dataset sample will be saved as:
+### `generated_dataset/`
+
+This folder contains generated output samples.
 
 ```text
 generated_dataset/
-├── xpl/
-│   └── sample_0001.png
-├── ppl/
-│   └── sample_0001.png
 ├── labels/
-│   └── sample_0001.png
-└── manifest.csv
+├── ppl/
+└── xpl/
 ```
 
-The label image is a single-channel semantic mask with class values:
+* `xpl/`: generated cross-polarized light thin-section images;
+* `ppl/`: generated plane-polarized light thin-section images;
+* `labels/`: single-channel semantic label masks.
 
-- `0`: pore/background
-- `1`: quartz
-- `2`: feldspar
-- `3`: lithic fragments
+The label masks are saved as grayscale images with the following pixel values:
+
+```text
+0 = pore/background
+1 = quartz
+2 = feldspar
+3 = lithic fragments
+```
+
+## Requirements
+
+The code was developed using Python and common scientific image-processing libraries.
+
+Recommended packages include:
+
+```text
+numpy
+opencv-python
+scipy
+scikit-image
+matplotlib
+jupyter
+```
+
+Install the required packages using:
+
+```bash
+pip install numpy opencv-python scipy scikit-image matplotlib jupyter
+```
+
+## How to run
+
+1. Clone or download this repository.
+2. Open `thin-section_generation_workflow_sample.ipynb` in Jupyter Notebook or JupyterLab.
+3. Check and modify the paths in the notebook if necessary.
+4. Run the notebook cells in order.
+5. The generated images and labels will be saved in `generated_dataset/`.
+
+## Output format
+
+Each generated sample contains:
+
+```text
+generated_dataset/
+├── xpl/sample_name.png
+├── ppl/sample_name.png
+└── labels/sample_name.png
+```
+
+The generated XPL and PPL images share the same spatial structure and correspond to the same single-channel semantic label mask.
 
 ## Notes
 
-- Only one XPL image is generated for each sample in this public version.
-- RGB label visualization is not generated by default because the saved single-channel mask is intended for semantic segmentation training.
-- The DDPM training procedure is not included. The particle library can contain manually extracted particles, diffusion-generated particles, or both.
-- The provided configuration file is an example. Raw data and particle libraries are not included.
+* This repository provides a simplified method demonstration rather than the full dataset used in the manuscript.
+* Only one XPL image and one PPL image are generated for each sample in this public workflow.
+* RGB label visualization is not generated by default because the saved single-channel mask is intended for semantic segmentation training.
+* DDPM training code is not included. The particle library may contain manually extracted particles, diffusion-generated particles, or both.
+* Semantic segmentation model training and testing code are not included.
+* Users should modify file paths and parameters in the notebook according to their own data organization.
+
+## Code availability
+
+The source code for the synthetic sandstone thin-section generation workflow is available at:
+
+```text
+https://github.com/DG24ZX/sandstone-thin-section-generation
+```
+
+The complete raw digital-core data, complete mineral particle library, and full experimental dataset are not included in this repository because of file size and data-sharing restrictions.
