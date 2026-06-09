@@ -19,6 +19,7 @@ Sandstone-thin-section-annotated-sample-generation-workflow/
 ├── README.md
 ├── requirements.txt
 ├── thin-section_generation_workflow_sample.ipynb
+├── LICENSE
 └── tools.py
 ```
 
