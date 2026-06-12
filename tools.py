@@ -1,17 +1,14 @@
 """
-tools_clean.py
+tools.py
 
-Cleaned utility functions for sandstone thin-section annotated sample generation.
+Functions for sandstone thin-section annotated sample generation.
 
-This file was refactored from the original notebook workflow and tools_v2.py.
-Only the functions required for the manuscript workflow are kept:
 
 1. Read digital-core raw slices.
 2. Segment mineral regions into independent particle instances.
 3. Select one XPL texture and one PPL texture from the mineral particle library.
 4. Reconstruct one XPL image, one PPL image, and one single-channel label mask.
-5. Apply simulation-based enhancement, including dissolution pores, edge smoothing,
-   and clay-mineral cementation rims.
+5. Applied to the simulation of pore backgrounds, feldspar dissolution, and clay mineral cementation rims.
 6. Save outputs in semantic-segmentation dataset format.
 
 Default output:
@@ -403,38 +400,88 @@ def smooth_mask_boundary(mask: np.ndarray, sigma: float = 2, min_pts: int = 10) 
     return new_mask
 
 
+def repair_particle_masks(particle_masks: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
+    """
+    Rebuild the background mask after mineral-mask smoothing.
+
+    Independent smoothing can slightly shrink particle masks and leave tiny
+    uncovered pixels between particles. This function defines the background
+    as the complement of all mineral masks, so the mineral masks and
+    background fully tile the image.
+    """
+    if len(particle_masks) == 0:
+        return particle_masks
+
+    first_mask = next(iter(particle_masks.values()))
+    H, W = first_mask.shape
+
+    repaired = {}
+    occupied = np.zeros((H, W), dtype=np.uint8)
+
+    for value in sorted(particle_masks.keys()):
+        value = int(value)
+        if value == 0:
+            continue
+        mask = (particle_masks[value] > 0).astype(np.uint8) * 255
+        repaired[value] = mask
+        occupied[mask > 0] = 255
+
+    background_mask = np.zeros((H, W), dtype=np.uint8)
+    background_mask[occupied == 0] = 255
+    repaired[0] = background_mask
+
+    return dict(sorted(repaired.items(), key=lambda x: x[0]))
+
+
 def smooth_particle_masks(
     particle_masks: Dict[int, np.ndarray],
-    kernel_size: int = 5,
-    blur_kernel: int = 11,
-    blur_sigma: float = 5,
+    kernel_size: int = 3,
+    blur_kernel: int = 5,
+    blur_sigma: float = 2,
     perturb: bool = False,
     max_offset: int = 3,
 ) -> Dict[int, np.ndarray]:
     """
-    Apply optional morphological smoothing and boundary perturbation to particle masks.
-    This is a compact wrapper around the logic previously written in notebook cells.
+    Smooth particle masks while avoiding boundary shrinkage and gaps.
+
+    Changes relative to the original notebook logic:
+    1. The background mask is not smoothed directly.
+    2. Morphological closing is used without opening, because opening tends
+       to erode grain edges and create small gaps.
+    3. Gaussian smoothing is mild.
+    4. The background mask is rebuilt after smoothing, so the final mask set
+       fully covers the image.
     """
     out = {}
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
 
+    # Ensure odd blur kernel.
+    if blur_kernel % 2 == 0:
+        blur_kernel += 1
+
     for value, mask in particle_masks.items():
+        value = int(value)
+        if value == 0:
+            continue
+
         mask = mask.astype(np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        # Closing fills tiny holes/gaps without the shrinkage caused by opening.
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
+        # Mild boundary smoothing.
         blur = cv2.GaussianBlur(mask.astype(np.float32), (blur_kernel, blur_kernel), sigmaX=blur_sigma)
         _, mask = cv2.threshold(blur, 127, 255, cv2.THRESH_BINARY)
         mask = mask.astype(np.uint8)
 
-        if perturb and value != 0:
+        if perturb:
             mask = perturb_mask_boundary(mask, max_offset=max_offset, smooth_iter=1)
             mask = smooth_mask_boundary(mask, sigma=2)
 
-        out[int(value)] = mask.astype(np.uint8)
+        out[value] = mask
 
+    out = repair_particle_masks(out)
     return out
-
 
 # ---------------------------------------------------------------------
 # Texture selection and preprocessing
@@ -446,6 +493,10 @@ MEMORY_CACHE: Dict[str, Dict[str, Tuple[int, int]]] = {}
 def get_or_build_cache(image_folder: str | Path) -> Dict[str, Tuple[int, int]]:
     """
     Get or build an image-size cache for a texture folder.
+
+    The cache records image width and height for texture matching.
+    Image reading uses _imread_bgr() to support Windows paths containing
+    non-ASCII characters.
     """
     global MEMORY_CACHE
 
@@ -466,7 +517,7 @@ def get_or_build_cache(image_folder: str | Path) -> Dict[str, Tuple[int, int]]:
             disk_cache = {}
 
     memory_cache = {}
-    valid_extensions = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+    valid_extensions = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
     image_folder_path = Path(image_folder)
 
     for img_name in os.listdir(image_folder):
@@ -485,11 +536,14 @@ def get_or_build_cache(image_folder: str | Path) -> Dict[str, Tuple[int, int]]:
                 disk_cache[img_name]["height"],
             )
         else:
-            img = cv2.imread(str(img_path))
-            if img is not None:
-                h, w = img.shape[:2]
-                memory_cache[img_name] = (w, h)
-                disk_cache[img_name] = {"width": w, "height": h, "mtime": img_mtime}
+            try:
+                img = _imread_bgr(img_path)
+            except Exception:
+                continue
+
+            h, w = img.shape[:2]
+            memory_cache[img_name] = (w, h)
+            disk_cache[img_name] = {"width": w, "height": h, "mtime": img_mtime}
 
     try:
         temp_cache_path = cache_path.with_suffix(".tmp")
@@ -501,7 +555,6 @@ def get_or_build_cache(image_folder: str | Path) -> Dict[str, Tuple[int, int]]:
 
     MEMORY_CACHE[image_folder] = memory_cache
     return memory_cache
-
 
 def calculate_score(
     w_img: int,
@@ -524,12 +577,27 @@ def calculate_score(
     return float(width_diff + ratio_diff)
 
 
-def _read_rgb(path: Path) -> np.ndarray:
-    img = cv2.imread(str(path))
+def _imread_bgr(path: str | Path) -> np.ndarray:
+    """
+    Read an image as BGR using np.fromfile + cv2.imdecode.
+
+    This is more robust than cv2.imread on Windows paths containing
+    non-ASCII characters.
+    """
+    path = Path(path)
+    data = np.fromfile(str(path), dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Cannot read image: {path}")
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img
 
+
+def _read_rgb(path: str | Path) -> np.ndarray:
+    """
+    Read an image as RGB.
+    """
+    img = _imread_bgr(path)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 def get_image(
     image_path: str | Path,
@@ -737,8 +805,6 @@ def generate_ppl_pore_texture(
 
     return img
 
-
-
 def generate_xpl_pore_texture(
     img_size: Tuple[int, int],
     mean_rgb=(0, 0, 0),
@@ -749,11 +815,10 @@ def generate_xpl_pore_texture(
     blur_kernel=(3, 3),
 ) -> np.ndarray:
     """
-    Generate XPL pore texture.
+    Generate XPL pore/background texture.
 
-    In the public demonstration workflow, pores/background under XPL are
-    represented as pure black. This avoids artificial speckled textures in
-    pore regions and in feldspar-dissolution pores.
+    In this public demonstration, pores/background under XPL are represented
+    as pure black to avoid artificial speckled pore textures.
     """
     h, w = img_size
     return np.zeros((h, w, 3), dtype=np.uint8)
@@ -791,20 +856,14 @@ def reconstruct_single_xpl_ppl(
     """
     Reconstruct one XPL image, one PPL image, and one single-channel label mask.
 
-    This function corresponds to the texture filling step in the notebook.
+    The whole canvas is initialized as pore/background first. Mineral textures
+    are then written on top of this background according to the instance masks.
+    This avoids residual black pixels in tiny uncovered gaps between masks.
     """
     H, W = rockSlice_segmented.shape[:2]
-
-    thin_xpl = np.zeros((H, W, 3), dtype=np.uint8)
-    thin_ppl = np.zeros((H, W, 3), dtype=np.uint8)
     label_mask = build_label_mask(particle_masks, num1=num1, num2=num2)
 
-    # Fill pores/background first.
-    if 0 in particle_masks:
-        pore_mask = particle_masks[0] == 255
-    else:
-        pore_mask = label_mask == 0
-
+    # Fill the entire canvas with pore/background first.
     ppl_pore_tex = generate_ppl_pore_texture(
         img_size=(H, W),
         bg_color=(
@@ -821,25 +880,18 @@ def reconstruct_single_xpl_ppl(
         brightness=random.randint(-3, 3),
     )
 
-    xpl_pore_tex = generate_xpl_pore_texture(
-        img_size=(H, W),
-        mean_rgb=(random.randint(22, 28), random.randint(23, 29), random.randint(17, 23)),
-        std_rgb=(random.randint(4, 6), random.randint(4, 6), random.randint(4, 6)),
-        num_dark_spots=random.randint(800, 1300),
-        num_light_spots=random.randint(180, 320),
-        max_radius=random.randint(1, 2),
-        blur_kernel=random.choice([(3, 3), (5, 5)]),
-    )
+    xpl_pore_tex = generate_xpl_pore_texture(img_size=(H, W))
 
-    thin_ppl[pore_mask] = ppl_pore_tex[pore_mask]
-    thin_xpl[pore_mask] = xpl_pore_tex[pore_mask]
+    thin_ppl = ppl_pore_tex.copy()
+    thin_xpl = xpl_pore_tex.copy()
 
     # Fill mineral particles.
-    for value, mask in particle_masks.items():
+    for value in sorted(particle_masks.keys()):
         value = int(value)
         if value == 0:
             continue
 
+        mask = particle_masks[value]
         contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if len(contours) == 0:
             continue
@@ -876,10 +928,47 @@ def reconstruct_single_xpl_ppl(
 
     return thin_xpl, thin_ppl, label_mask
 
-
 # ---------------------------------------------------------------------
 # Simulation-based enhancement
 # ---------------------------------------------------------------------
+
+def fill_mask_with_nearest_pore_texture(
+    image: np.ndarray,
+    fill_mask: np.ndarray,
+    pore_reference_mask: np.ndarray,
+    fallback_color=(199, 220, 199),
+) -> np.ndarray:
+    """
+    Fill a target mask using nearest existing pore/background texture.
+
+    This makes feldspar-dissolution pores visually consistent with the
+    pore/background generated during reconstruction.
+    """
+    out = image.copy()
+    fill_mask = fill_mask.astype(bool)
+    pore_reference_mask = pore_reference_mask.astype(bool)
+
+    if not np.any(fill_mask):
+        return out
+
+    if not np.any(pore_reference_mask):
+        out[fill_mask] = np.array(fallback_color, dtype=np.uint8)
+        return out
+
+    source = np.ones(fill_mask.shape, dtype=np.uint8)
+    source[pore_reference_mask] = 0
+
+    _, indices = ndi.distance_transform_edt(
+        source,
+        return_distances=True,
+        return_indices=True,
+    )
+
+    nearest_y = indices[0]
+    nearest_x = indices[1]
+    out[fill_mask] = image[nearest_y[fill_mask], nearest_x[fill_mask]]
+
+    return out
 
 
 def apply_dissolution_effect(
@@ -887,16 +976,16 @@ def apply_dissolution_effect(
     thin_ppl: np.ndarray,
     dissolution_mask: np.ndarray,
     ppl_base_color=(199, 220, 199),
+    pore_reference_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Apply feldspar-dissolution pore effect.
 
-    The dissolved feldspar regions are converted to pore/background:
+    Dissolved feldspar regions are converted to pore/background:
         - XPL: pure black.
-        - PPL: the same pore-background color used in the reconstructed PPL image.
+        - PPL: nearest existing pore-background texture.
 
-    Only a narrow edge transition is smoothed. No random mineral texture is
-    filled into the dissolution pores.
+    Only the immediate dissolution boundary is slightly smoothed.
     """
     out_xpl = thin_xpl.copy()
     out_ppl = thin_ppl.copy()
@@ -905,14 +994,21 @@ def apply_dissolution_effect(
     if not np.any(mask):
         return out_xpl, out_ppl
 
-    # XPL: dissolution pores are optically dark.
+    # XPL dissolution pores are optically dark.
     out_xpl[mask] = np.array([0, 0, 0], dtype=np.uint8)
 
-    # PPL: dissolution pores use the pore/background color, not a new texture.
-    pore_color = np.array(ppl_base_color, dtype=np.uint8)
-    out_ppl[mask] = pore_color
+    # PPL dissolution pores should match the original pore background.
+    if pore_reference_mask is not None and np.any(pore_reference_mask):
+        out_ppl = fill_mask_with_nearest_pore_texture(
+            out_ppl,
+            fill_mask=mask,
+            pore_reference_mask=pore_reference_mask,
+            fallback_color=ppl_base_color,
+        )
+    else:
+        out_ppl[mask] = np.array(ppl_base_color, dtype=np.uint8)
 
-    # Smooth only the immediate dissolution boundary to avoid hard stair-step edges.
+    # Smooth only the immediate dissolution boundary to avoid a hard cut.
     mask_u8 = mask.astype(np.uint8) * 255
     edge = cv2.Canny(mask_u8, 50, 150)
     edge = cv2.dilate(edge, np.ones((3, 3), np.uint8), iterations=1)
@@ -956,71 +1052,67 @@ def porEdgeSmooth(
     return out_cross, out_single, edges_dilated
 
 
-
 def addClay(
     thin_cross: np.ndarray,
     thin_single: np.ndarray,
     edges: np.ndarray,
-    colorValue=(169, 166, 171),
-    edges_max: int = 10,
+    colorValue=(150, 145, 120),
+    edges_max: int = 8,
     fill_probability: float = 0.35,
-    color_scale: float = 0.85,
+    color_scale: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Add clay-mineral/cementation rims along grain boundaries.
+    Add clay/cementation rims along grain boundaries.
 
-    This revised version generates a continuous, softly blended rim instead
-    of isolated salt-and-pepper pixels. The PPL rim is produced by alpha
-    blending a clay-like color with the original image. The XPL rim is
-    slightly darkened, while pore regions remain black when they have already
-    been set to black.
+    This version avoids the blurred-halo effect. It builds a narrow,
+    continuous rim mask and applies weak alpha blending rather than directly
+    blurring the original PPL/XPL images.
     """
     edge_binary = (edges > 0).astype(np.uint8)
     if not np.any(edge_binary):
         empty = np.zeros_like(edges, dtype=np.uint8)
         return thin_cross.copy(), thin_single.copy(), empty
 
-    # Convert the edge map into a continuous rim band.
-    # The original call uses edges_max=13. A quarter of this value gives a
-    # moderate rim width suitable for 1200 x 1200 demonstration images.
-    rim_width = max(2, int(round(edges_max / 4)))
+    # Narrow continuous rim. Keep width small to avoid a halo.
+    rim_width = max(1, min(2, int(round(edges_max / 10))))
     kernel_size = rim_width * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
 
     rim_mask = cv2.dilate(edge_binary, kernel, iterations=1)
     rim_mask = cv2.morphologyEx(rim_mask, cv2.MORPH_CLOSE, kernel)
 
-    # Soft alpha mask for gradual transition.
-    rim_alpha = cv2.GaussianBlur(rim_mask.astype(np.float32), (0, 0), sigmaX=max(1.5, rim_width))
+    # Smooth only the alpha mask mildly.
+    rim_alpha = cv2.GaussianBlur(rim_mask.astype(np.float32), (3, 3), sigmaX=0.7)
     rim_alpha = rim_alpha / (rim_alpha.max() + 1e-8)
 
-    # Low-frequency variation only. This avoids the previous discrete-dot appearance.
-    low_freq_noise = np.random.normal(0, 1, size=edges.shape).astype(np.float32)
-    low_freq_noise = cv2.GaussianBlur(low_freq_noise, (0, 0), sigmaX=18)
+    # Low-frequency variation, not isolated dark pixels.
+    low_freq_noise = np.random.rand(*edges.shape).astype(np.float32)
+    low_freq_noise = cv2.GaussianBlur(low_freq_noise, (0, 0), sigmaX=25)
     low_freq_noise = (low_freq_noise - low_freq_noise.min()) / (
         low_freq_noise.max() - low_freq_noise.min() + 1e-8
     )
+
+    strength = 0.10 + 0.05 * low_freq_noise
+    strength = strength * (0.8 + 0.4 * fill_probability)
+
+    alpha = (rim_alpha * strength)[..., None]
+    alpha = np.clip(alpha, 0.0, 0.18)
 
     out_cross = thin_cross.astype(np.float32).copy()
     out_single = thin_single.astype(np.float32).copy()
 
     clay_color = np.clip(np.array(colorValue, dtype=np.float32) * color_scale, 0, 255)
 
-    # PPL: continuous clay/cementation rim by color blending.
-    # Strength is intentionally moderate to avoid black, speckled boundaries.
-    ppl_strength = (0.30 + 0.12 * low_freq_noise)[..., None] * rim_alpha[..., None]
-    out_single = out_single * (1.0 - ppl_strength) + clay_color[None, None, :] * ppl_strength
+    # PPL: weak clay-color blending.
+    out_single = out_single * (1.0 - alpha) + clay_color[None, None, :] * alpha
 
-    # XPL: cementation/rim areas are slightly darkened and kept continuous.
-    xpl_strength = (0.20 + 0.10 * low_freq_noise)[..., None] * rim_alpha[..., None]
-    out_cross = out_cross * (1.0 - xpl_strength)
+    # XPL: very slight darkening along the rim.
+    out_cross = out_cross * (1.0 - 0.08 * alpha)
 
     out_cross = np.clip(out_cross, 0, 255).astype(np.uint8)
     out_single = np.clip(out_single, 0, 255).astype(np.uint8)
 
-    # Return a compact binary mask for optional label update.
-    clay_mask = (rim_alpha > 0.20).astype(np.uint8)
-
+    clay_mask = (rim_mask > 0).astype(np.uint8)
     return out_cross, out_single, clay_mask
 
 def get_instance_edges(rockSlice_segmented: np.ndarray, threshold1: int = 1, threshold2: int = 2) -> np.ndarray:
@@ -1041,24 +1133,26 @@ def apply_simulation_enhancement(
     add_clay: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     """
-    Apply dissolution, edge smoothing, and clay-rim enhancement.
+    Apply feldspar-dissolution and clay/cementation-rim enhancement.
+
+    Dissolution is applied only to the provided dissolution mask. Clay rims
+    are applied as a narrow weak boundary enhancement. The function does not
+    blur all grain boundaries globally.
     """
     out_xpl = thin_xpl.copy()
     out_ppl = thin_ppl.copy()
     masks = {}
 
-    rock_for_smoothing = (rockSlice_segmented > 0).astype(np.uint8)
-
     if dissolution_mask is not None and np.any(dissolution_mask):
+        pore_reference_mask = rockSlice_segmented == 0
         out_xpl, out_ppl = apply_dissolution_effect(
-            out_xpl, out_ppl, dissolution_mask, ppl_base_color=ppl_pore_color
+            out_xpl,
+            out_ppl,
+            dissolution_mask,
+            ppl_base_color=ppl_pore_color,
+            pore_reference_mask=pore_reference_mask,
         )
-        rock_for_smoothing = rock_for_smoothing.copy()
-        rock_for_smoothing[dissolution_mask.astype(bool)] = 0
-        out_xpl, out_ppl, dissolution_edges = porEdgeSmooth(
-            out_xpl, out_ppl, rock_for_smoothing, crossGaussian=(5, 5), singleGaussian=(5, 5)
-        )
-        masks["dissolution_edges"] = dissolution_edges
+        masks["dissolution_mask"] = dissolution_mask.astype(np.uint8)
 
     if add_clay:
         edges = get_instance_edges(rockSlice_segmented)
@@ -1066,10 +1160,10 @@ def apply_simulation_enhancement(
             out_xpl,
             out_ppl,
             edges,
-            colorValue=(169, 166, 171),
-            edges_max=13,
+            colorValue=(150, 145, 120),
+            edges_max=8,
             fill_probability=0.35,
-            color_scale=0.85,
+            color_scale=1.0,
         )
         masks["clay_mask"] = clay_mask
 
